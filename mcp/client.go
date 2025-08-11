@@ -134,8 +134,8 @@ func (c *Client) Connect(ctx context.Context, t Transport) (cs *ClientSession, e
 		return nil, unsupportedProtocolVersionError{res.ProtocolVersion}
 	}
 	cs.initializeResult = res
-	if hc, ok := cs.mcpConn.(httpConnection); ok {
-		hc.setProtocolVersion(res.ProtocolVersion)
+	if hc, ok := cs.mcpConn.(clientConnection); ok {
+		hc.initialized(res)
 	}
 	if err := handleNotify(ctx, cs, notificationInitialized, &InitializedParams{}); err != nil {
 		_ = cs.Close()
@@ -153,8 +153,8 @@ func (c *Client) Connect(ctx context.Context, t Transport) (cs *ClientSession, e
 // methods can be used to send requests or notifications to the server. Create
 // a session by calling [Client.Connect].
 //
-// Call [ClientSession.Close] to close the connection, or await client
-// termination with [ServerSession.Wait].
+// Call [ClientSession.Close] to close the connection, or await server
+// termination with [ClientSession.Wait].
 type ClientSession struct {
 	conn             *jsonrpc2.Connection
 	client           *Client
@@ -250,7 +250,7 @@ func (c *Client) listRoots(_ context.Context, _ *ClientSession, _ *ListRootsPara
 func (c *Client) createMessage(ctx context.Context, cs *ClientSession, params *CreateMessageParams) (*CreateMessageResult, error) {
 	if c.opts.CreateMessageHandler == nil {
 		// TODO: wrap or annotate this error? Pick a standard code?
-		return nil, &jsonrpc2.WireError{Code: CodeUnsupportedMethod, Message: "client does not support CreateMessage"}
+		return nil, jsonrpc2.NewError(CodeUnsupportedMethod, "client does not support CreateMessage")
 	}
 	return c.opts.CreateMessageHandler(ctx, cs, params)
 }
