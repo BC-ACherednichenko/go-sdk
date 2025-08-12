@@ -275,6 +275,8 @@ func sessionMethod[S Session, P Params, R Result](f func(S, context.Context, P) 
 
 // Error codes
 const (
+	// TODO: should these be unexported?
+
 	CodeResourceNotFound = -32002
 	// The error code if the method exists and was called properly, but the peer does not support it.
 	CodeUnsupportedMethod = -31001
@@ -335,6 +337,9 @@ func setProgressToken(p Params, pt any) {
 
 // Params is a parameter (input) type for an MCP call or notification.
 type Params interface {
+	// isParams discourages implementation of Params outside of this package.
+	isParams()
+
 	// GetMeta returns metadata from a value.
 	GetMeta() map[string]any
 	// SetMeta sets the metadata on a value.
@@ -356,6 +361,9 @@ type RequestParams interface {
 
 // Result is a result of an MCP call.
 type Result interface {
+	// isResult discourages implementation of Result outside of this package.
+	isResult()
+
 	// GetMeta returns metadata from a value.
 	GetMeta() map[string]any
 	// SetMeta sets the metadata on a value.
@@ -366,6 +374,7 @@ type Result interface {
 // Those methods cannot return nil, because jsonrpc2 cannot handle nils.
 type emptyResult struct{}
 
+func (*emptyResult) isResult()               {}
 func (*emptyResult) GetMeta() map[string]any { panic("should never be called") }
 func (*emptyResult) SetMeta(map[string]any)  { panic("should never be called") }
 

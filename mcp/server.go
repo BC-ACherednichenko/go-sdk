@@ -301,7 +301,7 @@ func (s *Server) listPrompts(_ context.Context, _ *ServerSession, params *ListPr
 	})
 }
 
-func (s *Server) getPrompt(ctx context.Context, cc *ServerSession, params *GetPromptParams) (*GetPromptResult, error) {
+func (s *Server) getPrompt(ctx context.Context, ss *ServerSession, params *GetPromptParams) (*GetPromptResult, error) {
 	s.mu.Lock()
 	prompt, ok := s.prompts.get(params.Name)
 	s.mu.Unlock()
@@ -309,7 +309,7 @@ func (s *Server) getPrompt(ctx context.Context, cc *ServerSession, params *GetPr
 		// TODO: surface the error code over the wire, instead of flattening it into the string.
 		return nil, fmt.Errorf("%s: unknown prompt %q", jsonrpc2.ErrInvalidParams, params.Name)
 	}
-	return prompt.handler(ctx, cc, params)
+	return prompt.handler(ctx, ss, params)
 }
 
 func (s *Server) listTools(_ context.Context, _ *ServerSession, params *ListToolsParams) (*ListToolsResult, error) {
@@ -513,8 +513,12 @@ func (s *Server) unsubscribe(ctx context.Context, ss *ServerSession, params *Uns
 // advertise the capability for tools, including the ability to send list-changed notifications.
 // If no tools have been added, the server will not have the tool capability.
 // The same goes for other features like prompts and resources.
+//
+// Run is a convenience for servers that handle a single session (or one session at a time).
+// It need not be called on servers that are used for multiple concurrent connections,
+// as with [StreamableHTTPHandler].
 func (s *Server) Run(ctx context.Context, t Transport) error {
-	ss, err := s.Connect(ctx, t)
+	ss, err := s.Connect(ctx, t, nil)
 	if err != nil {
 		return err
 	}
@@ -535,8 +539,12 @@ func (s *Server) Run(ctx context.Context, t Transport) error {
 
 // bind implements the binder[*ServerSession] interface, so that Servers can
 // be connected using [connect].
-func (s *Server) bind(conn *jsonrpc2.Connection) *ServerSession {
-	ss := &ServerSession{conn: conn, server: s}
+func (s *Server) bind(mcpConn Connection, conn *jsonrpc2.Connection, state *ServerSessionState) *ServerSession {
+	assert(mcpConn != nil && conn != nil, "nil connection")
+	ss := &ServerSession{conn: conn, mcpConn: mcpConn, server: s}
+	if state != nil {
+		ss.state = *state
+	}
 	s.mu.Lock()
 	s.sessions = append(s.sessions, ss)
 	s.mu.Unlock()
@@ -557,21 +565,53 @@ func (s *Server) disconnect(cc *ServerSession) {
 	}
 }
 
+// ServerSessionOptions configures the server session.
+type ServerSessionOptions struct {
+	State *ServerSessionState
+}
+
 // Connect connects the MCP server over the given transport and starts handling
 // messages.
 //
 // It returns a connection object that may be used to terminate the connection
 // (with [Connection.Close]), or await client termination (with
 // [Connection.Wait]).
-func (s *Server) Connect(ctx context.Context, t Transport) (*ServerSession, error) {
-	return connect(ctx, t, s)
+//
+// If opts.State is non-nil, it is the initial state for the server.
+func (s *Server) Connect(ctx context.Context, t Transport, opts *ServerSessionOptions) (*ServerSession, error) {
+	var state *ServerSessionState
+	if opts != nil {
+		state = opts.State
+	}
+	return connect(ctx, t, s, state)
 }
 
-func (s *Server) callInitializedHandler(ctx context.Context, ss *ServerSession, params *InitializedParams) (Result, error) {
-	if s.opts.KeepAlive > 0 {
-		ss.startKeepalive(s.opts.KeepAlive)
+// TODO: (nit) move all ServerSession methods below the ServerSession declaration.
+func (ss *ServerSession) initialized(ctx context.Context, params *InitializedParams) (Result, error) {
+	if params == nil {
+		// Since we use nilness to signal 'initialized' state, we must ensure that
+		// params are non-nil.
+		params = new(InitializedParams)
 	}
-	return callNotificationHandler(ctx, s.opts.InitializedHandler, ss, params)
+	if ss.server.opts.KeepAlive > 0 {
+		ss.startKeepalive(ss.server.opts.KeepAlive)
+	}
+	var wasInit, wasInitd bool
+	ss.updateState(func(state *ServerSessionState) {
+		wasInit = state.InitializeParams != nil
+		wasInitd = state.InitializedParams != nil
+		if wasInit && !wasInitd {
+			state.InitializedParams = params
+		}
+	})
+
+	if !wasInit {
+		return nil, fmt.Errorf("%q before %q", notificationInitialized, methodInitialize)
+	}
+	if wasInitd {
+		return nil, fmt.Errorf("duplicate %q received", notificationInitialized)
+	}
+	return callNotificationHandler(ctx, ss.server.opts.InitializedHandler, ss, params)
 }
 
 func (s *Server) callRootsListChangedHandler(ctx context.Context, ss *ServerSession, params *RootsListChangedParams) (Result, error) {
@@ -597,25 +637,30 @@ func (ss *ServerSession) NotifyProgress(ctx context.Context, params *ProgressNot
 // Call [ServerSession.Close] to close the connection, or await client
 // termination with [ServerSession.Wait].
 type ServerSession struct {
-	server           *Server
-	conn             *jsonrpc2.Connection
-	mcpConn          Connection
-	mu               sync.Mutex
-	logLevel         LoggingLevel
-	initializeParams *InitializeParams
-	initialized      bool
-	keepaliveCancel  context.CancelFunc
+	server          *Server
+	conn            *jsonrpc2.Connection
+	mcpConn         Connection
+	keepaliveCancel context.CancelFunc // TODO: theory around why keepaliveCancel need not be guarded
+
+	mu    sync.Mutex
+	state ServerSessionState
 }
 
-func (ss *ServerSession) setConn(c Connection) {
-	ss.mcpConn = c
+func (ss *ServerSession) updateState(mut func(*ServerSessionState)) {
+	ss.mu.Lock()
+	mut(&ss.state)
+	copy := ss.state
+	ss.mu.Unlock()
+	if c, ok := ss.mcpConn.(serverConnection); ok {
+		c.sessionUpdated(copy)
+	}
 }
 
 func (ss *ServerSession) ID() string {
-	if ss.mcpConn == nil {
-		return ""
+	if c, ok := ss.mcpConn.(hasSessionID); ok {
+		return c.SessionID()
 	}
-	return ss.mcpConn.SessionID()
+	return ""
 }
 
 // Ping pings the client.
@@ -639,7 +684,7 @@ func (ss *ServerSession) CreateMessage(ctx context.Context, params *CreateMessag
 // is below that of the last SetLevel.
 func (ss *ServerSession) Log(ctx context.Context, params *LoggingMessageParams) error {
 	ss.mu.Lock()
-	logLevel := ss.logLevel
+	logLevel := ss.state.LogLevel
 	ss.mu.Unlock()
 	if logLevel == "" {
 		// The spec is unclear, but seems to imply that no log messages are sent until the client
@@ -702,7 +747,7 @@ var serverMethodInfos = map[string]methodInfo{
 	methodSetLevel:               newMethodInfo(sessionMethod((*ServerSession).setLevel), 0),
 	methodSubscribe:              newMethodInfo(serverMethod((*Server).subscribe), 0),
 	methodUnsubscribe:            newMethodInfo(serverMethod((*Server).unsubscribe), 0),
-	notificationInitialized:      newMethodInfo(serverMethod((*Server).callInitializedHandler), notification|missingParamsOK),
+	notificationInitialized:      newMethodInfo(sessionMethod((*ServerSession).initialized), notification|missingParamsOK),
 	notificationRootsListChanged: newMethodInfo(serverMethod((*Server).callRootsListChangedHandler), notification|missingParamsOK),
 	notificationProgress:         newMethodInfo(sessionMethod((*ServerSession).callProgressNotificationHandler), notification),
 }
@@ -729,13 +774,13 @@ func (ss *ServerSession) getConn() *jsonrpc2.Connection { return ss.conn }
 // handle invokes the method described by the given JSON RPC request.
 func (ss *ServerSession) handle(ctx context.Context, req *jsonrpc.Request) (any, error) {
 	ss.mu.Lock()
-	initialized := ss.initialized
+	initialized := ss.state.InitializedParams != nil
 	ss.mu.Unlock()
 	// From the spec:
 	// "The client SHOULD NOT send requests other than pings before the server
 	// has responded to the initialize request."
 	switch req.Method {
-	case "initialize", "ping":
+	case methodInitialize, methodPing, notificationInitialized:
 	default:
 		if !initialized {
 			return nil, fmt.Errorf("method %q is invalid during session initialization", req.Method)
@@ -752,20 +797,9 @@ func (ss *ServerSession) initialize(ctx context.Context, params *InitializeParam
 	if params == nil {
 		return nil, fmt.Errorf("%w: \"params\" must be be provided", jsonrpc2.ErrInvalidParams)
 	}
-	ss.mu.Lock()
-	ss.initializeParams = params
-	ss.mu.Unlock()
-
-	// Mark the connection as initialized when this method exits.
-	// TODO: Technically, the server should not be considered initialized until it has
-	// *responded*, but we don't have adequate visibility into the jsonrpc2
-	// connection to implement that easily. In any case, once we've initialized
-	// here, we can handle requests.
-	defer func() {
-		ss.mu.Lock()
-		ss.initialized = true
-		ss.mu.Unlock()
-	}()
+	ss.updateState(func(state *ServerSessionState) {
+		state.InitializeParams = params
+	})
 
 	// If we support the client's version, reply with it. Otherwise, reply with our
 	// latest version.
@@ -789,9 +823,9 @@ func (ss *ServerSession) ping(context.Context, *PingParams) (*emptyResult, error
 }
 
 func (ss *ServerSession) setLevel(_ context.Context, params *SetLevelParams) (*emptyResult, error) {
-	ss.mu.Lock()
-	defer ss.mu.Unlock()
-	ss.logLevel = params.Level
+	ss.updateState(func(state *ServerSessionState) {
+		state.LogLevel = params.Level
+	})
 	return &emptyResult{}, nil
 }
 

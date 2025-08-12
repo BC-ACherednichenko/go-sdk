@@ -11,7 +11,7 @@ import (
 	"os"
 	"time"
 
-	"github.com/modelcontextprotocol/go-sdk/jsonschema"
+	"github.com/google/jsonschema-go/jsonschema"
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 )
 
@@ -114,10 +114,10 @@ func Example_loggingMiddleware() {
 	ctx := context.Background()
 
 	// Connect server and client
-	serverSession, _ := server.Connect(ctx, serverTransport)
+	serverSession, _ := server.Connect(ctx, serverTransport, nil)
 	defer serverSession.Close()
 
-	clientSession, _ := client.Connect(ctx, clientTransport)
+	clientSession, _ := client.Connect(ctx, clientTransport, nil)
 	defer clientSession.Close()
 
 	// Call the tool to demonstrate logging
