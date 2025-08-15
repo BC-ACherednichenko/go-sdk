@@ -706,7 +706,7 @@ func testStreamableHandler(t *testing.T, handler http.Handler, requests []stream
 		if !request.ignoreResponse {
 			transform := cmpopts.AcyclicTransformer("jsonrpcid", func(id jsonrpc.ID) any { return id.Raw() })
 			if diff := cmp.Diff(request.wantMessages, got, transform); diff != "" {
-				t.Errorf("received unexpected messages (-want +got):\n%s", diff)
+				t.Errorf("request #%d: received unexpected messages (-want +got):\n%s", i, diff)
 			}
 		}
 		sessionID.CompareAndSwap("", gotSessionID)
@@ -955,18 +955,17 @@ func TestEventID(t *testing.T) {
 }
 
 func TestStreamableStateless(t *testing.T) {
-	// This version of sayHi doesn't make a ping request (we can't respond to
+	// This version of sayHi expects
 	// that request from our client).
 	sayHi := func(ctx context.Context, req *ServerRequest[*CallToolParamsFor[hiParams]]) (*CallToolResult, error) {
+		if err := req.Session.Ping(ctx, nil); err == nil {
+			// ping should fail, but not break the connection
+			t.Errorf("ping succeeded unexpectedly")
+		}
 		return &CallToolResult{Content: []Content{&TextContent{Text: "hi " + req.Params.Arguments.Name}}}, nil
 	}
 	server := NewServer(testImpl, nil)
 	AddTool(server, &Tool{Name: "greet", Description: "say hi"}, sayHi)
-
-	// Test stateless mode.
-	handler := NewStreamableHTTPHandler(func(*http.Request) *Server { return server }, &StreamableHTTPOptions{
-		GetSessionID: func() string { return "" },
-	})
 
 	requests := []streamableRequest{
 		{
@@ -987,7 +986,43 @@ func TestStreamableStateless(t *testing.T) {
 			},
 			wantSessionID: false,
 		},
+		{
+			method:         "POST",
+			wantStatusCode: http.StatusOK,
+			messages: []jsonrpc.Message{
+				req(2, "tools/call", &CallToolParams{Name: "greet", Arguments: hiParams{Name: "foo"}}),
+			},
+			wantMessages: []jsonrpc.Message{
+				resp(2, &CallToolResult{Content: []Content{&TextContent{Text: "hi foo"}}}, nil),
+			},
+			wantSessionID: false,
+		},
 	}
 
-	testStreamableHandler(t, handler, requests)
+	handler := NewStreamableHTTPHandler(func(*http.Request) *Server { return server }, &StreamableHTTPOptions{
+		GetSessionID: func() string { return "" },
+		Stateless:    true,
+	})
+
+	// Test the default stateless mode.
+	t.Run("stateless", func(t *testing.T) {
+		testStreamableHandler(t, handler, requests)
+	})
+
+	// Test a "distributed" variant of stateless mode, where it has non-empty
+	// session IDs, but is otherwise stateless.
+	//
+	// This can be used by tools to look up application state preserved across
+	// subsequent requests.
+	for i, req := range requests {
+		// Now, we want a session for all requests.
+		req.wantSessionID = true
+		requests[i] = req
+	}
+	distributableHandler := NewStreamableHTTPHandler(func(*http.Request) *Server { return server }, &StreamableHTTPOptions{
+		Stateless: true,
+	})
+	t.Run("distributed", func(t *testing.T) {
+		testStreamableHandler(t, distributableHandler, requests)
+	})
 }
